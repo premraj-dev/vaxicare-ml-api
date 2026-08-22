@@ -10,8 +10,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.demo_routes import router as demo_router
+
 
 # VaxiCare ML API: model-driven risk ranking with server-enforced reminder policy.
+# The Supabase service-role key is read only by app.database on the backend.
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "models" / "final_logistic_model.joblib"
 FEATURE_COLUMNS_PATH = BASE_DIR / "models" / "model_feature_columns.json"
@@ -43,7 +46,7 @@ LOCAL_ORIGINS = [
     "http://127.0.0.1:3000",
 ]
 DEPLOYED_ORIGINS = [
-    origin.strip( )
+    origin.strip()
     for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
     if origin.strip()
 ]
@@ -52,8 +55,11 @@ ALLOWED_ORIGINS = list(dict.fromkeys(LOCAL_ORIGINS + DEPLOYED_ORIGINS))
 
 app = FastAPI(
     title="VaxiCare ML API",
-    version="1.0.0",
-    description="Vaccination dropout-risk prediction, reminder planning, and ASHA prioritisation.",
+    version="1.1.0",
+    description=(
+        "Vaccination dropout-risk prediction, server-enforced reminder planning, "
+        "and Supabase-backed demo reminder records."
+    ),
 )
 
 app.add_middleware(
@@ -63,6 +69,9 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+# Adds /api/v1/demo/* routes without changing the ML prediction policy routes.
+app.include_router(demo_router)
 
 
 class PredictionRequest(BaseModel):
@@ -112,7 +121,6 @@ class ReminderPlanRequest(BaseModel):
 
 def risk_from_missed_doses(missed_dose_count: int) -> tuple[str, list[int]]:
     """The reminder policy is fixed by missed-dose count, not ML probability."""
-
     if missed_dose_count == 0:
         return "Normal", [1]
     if missed_dose_count == 1:
@@ -125,8 +133,7 @@ def risk_from_missed_doses(missed_dose_count: int) -> tuple[str, list[int]]:
 def calculate_priority_score(
     risk_level: str, days_overdue: int, dropout_probability: float
 ) -> float:
-    """Risk level is primary; overdue duration and ML probability are secondary signals."""
-
+    """Risk level is primary; overdue duration and ML probability are secondary."""
     risk_weight = {
         "Normal": 0,
         "Low": 100,
@@ -156,20 +163,27 @@ def root() -> dict:
         "message": "VaxiCare ML API is running.",
         "docs": "/docs",
         "health": "/health",
+        "supabase_demo": "/api/v1/demo/connection",
     }
 
 
 @app.get("/health")
 def health_check() -> dict:
+    """Health route stays available even if Supabase credentials are absent."""
     return {
         "status": "ok",
         "service": "VaxiCare ML API",
-        "version": "1.0.0",
+        "version": "1.1.0",
+        "supabase_configured": bool(
+            os.getenv("SUPABASE_URL", "").strip()
+            and os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+        ),
     }
 
 
 @app.post("/api/v1/predict")
 def predict_dropout_risk(request: PredictionRequest) -> dict:
+    """Predict probability; keep fixed reminder tier separate from the ML signal."""
     risk_level, _ = risk_from_missed_doses(request.missed_dose_count)
     model_input = request.model_dump(exclude={"days_overdue"})
 
@@ -212,6 +226,7 @@ def predict_dropout_risk(request: PredictionRequest) -> dict:
 
 @app.post("/api/v1/reminder-plan")
 def create_reminder_plan(request: ReminderPlanRequest) -> dict:
+    """Create the deterministic reminder plan without depending on ML probability."""
     risk_level, days_before = risk_from_missed_doses(request.missed_dose_count)
     today = date.today()
     due_date = request.next_dose_due_date
@@ -258,7 +273,9 @@ def create_reminder_plan(request: ReminderPlanRequest) -> dict:
                 **child_details,
                 "reminder_number": reminder_number,
                 "days_before_vaccine": days_before_vaccine,
-                "reminder_date": (due_date - timedelta(days=days_before_vaccine)).isoformat(),
+                "reminder_date": (
+                    due_date - timedelta(days=days_before_vaccine)
+                ).isoformat(),
                 "vaccine_due_date": due_date.isoformat(),
                 "channel": "SMS + Calling Agent",
                 "status": "Pending",
