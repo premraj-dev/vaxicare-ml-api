@@ -123,7 +123,7 @@ def list_demo_risk_queue(
     asha_id: str | None = Query(default=None, min_length=1),
     limit: int = Query(default=25, ge=1, le=100),
 ) -> dict[str, Any]:
-    """Return ASHA priorities ordered by deterministic priority score."""
+    """Return ASHA priorities ordered primarily by ML dropout probability."""
     try:
         query = (
             get_supabase_client()
@@ -133,6 +133,7 @@ def list_demo_risk_queue(
                 "model_version, assessed_at, "
                 "children!inner(id, full_name, assigned_asha_id, area_id)"
             )
+            .order("dropout_probability", desc=True)
             .order("priority_score", desc=True)
             .limit(limit)
         )
