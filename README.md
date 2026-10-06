@@ -1,150 +1,133 @@
-VaxiCare ML API
+# VaxiCare ML API
 
-VaxiCare ML API is a FastAPI service that loads the trained child-vaccination dropout model and provides two server-side capabilities: dropout-risk prediction and fixed reminder-plan generation.
+VaxiCare ML API is a FastAPI service that predicts child-vaccination dropout risk and drives ASHA worker prioritization, reminders, and village-level capacity planning.
 
-What this service does
+## What this service does
 
-The API uses the Logistic Regression model exported from Google Colab to calculate a dropout probability. The model probability is a secondary ASHA ranking signal. The number and timing of reminder events are determined only by the child’s missed-dose count.
+A Logistic Regression model (chosen over XGBoost after time-based evaluation) predicts dropout probability from historical dose adherence, seasonal factors, and geography — with strict leakage controls so only past-known data is used.
 
-Endpoint
-Purpose
-GET /health
-Confirms the service is running.
-POST /api/v1/predict
-Returns dropout probability, risk level, priority score, and recommended ASHA action.
-POST /api/v1/reminder-plan
-Applies the fixed Normal, Low, Medium, High, and overdue reminder policy.
+**ML probability is the primary ranking signal.** Missed-dose count acts only as a minimum risk floor, so a child with zero missed doses but a high predicted risk still surfaces near the top of the ASHA queue — this is a deliberate change from early-stage reminder-count-only ranking.
 
+## Model Performance
 
+Evaluated on a time-based train/test split with realistic class balance (11.25% positive dropout rate):
 
+| Metric | Logistic Regression | XGBoost |
+|---|---|---|
+| PR-AUC | 99.82% | 98.17% |
+| Precision | 91.84% | 92.08% |
+| Recall | 100.0% | 93.13% |
+| Recall@Top-10% | 88.89% | 85.56% |
+| Recall@Top-20% | 100.0% | 98.89% |
 
-Project structure
+Logistic Regression is deployed as the production model.
 
-Plain Text
+## Endpoints
 
+| Endpoint | Method | Auth | Purpose |
+|---|---|---|---|
+| `/health` | GET | — | Confirms the service is running |
+| `/api/v1/predict` | POST | X-API-Key* | Returns dropout probability, risk level, priority score, recommended ASHA action, and top 2–3 explainable `risk_reasons` |
+| `/api/v1/reminder-plan` | POST | X-API-Key* | Generates the deterministic missed-dose-based reminder schedule |
+| `/api/v1/asha/capacity-queue` | GET / POST | X-API-Key | Groups children by village, ranks by ML probability, caps the list to ASHA `daily_capacity` (1–50) |
+| `/api/v1/batch/daily-scoring` | POST | X-API-Key | Re-scores all active children, rebuilds the ASHA queue, flags reminder triggers — idempotent per day |
 
+\* Open fallback for `/predict` and `/reminder-plan` applies only when `ENVIRONMENT=development`. In production (`ENVIRONMENT=production` or `STRICT_AUTH=true`), all endpoints strictly require `X-API-Key`.
+
+## Explainable Predictions
+
+Every `/predict` response includes `risk_reasons`, e.g.:
+
+```json
+{
+  "dropout_probability": 0.9995,
+  "risk_level": "High",
+  "priority_score": 100.25,
+  "recommended_action": "Immediate ASHA Follow-up: Home Visit + Call",
+  "risk_reasons": [
+    "History of 1 missed vaccine dose(s)",
+    "Extended interval of 60 days since last dose",
+    "High physical distance (6.5 km) to health facility"
+  ]
+}
+```
+
+## Features Used
+
+Historical adherence (leakage-checked, past-only), missed-dose count, delay-related features, district-level coverage, plus seasonal and geographic signals:
+
+- `due_month`, `monsoon_flag`, `harvest_flag`, `migration_flag`
+- `distance_to_health_center` (km)
+
+All coverage/completion-rate fields are strictly validated to `[0.0, 1.0]` and rejected with `422` otherwise.
+
+## Village Capacity Queue
+
+`/api/v1/asha/capacity-queue` groups high-risk children by village, sorts each cluster by raw ML probability, and caps the visit list to the worker's `daily_capacity` (validated 1–50).
+
+## Daily Automated Scoring
+
+`/api/v1/batch/daily-scoring` re-evaluates all active children each morning, updates risk assessments, rebuilds the priority queue, and flags children for reminders. Re-running it on the same date returns `"idempotent_execution": true` without duplicating entries.
+
+## Project Structure
+
+```
 vaxicare-ml-api/
 ├── app/
-│   └── __init__.py
+│   ├── __init__.py
+│   ├── auth.py            # X-API-Key / Bearer auth, production enforcement
+│   ├── asha_routes.py      # capacity-queue, batch daily-scoring
+│   └── demo_routes.py      # demo risk-queue
 ├── models/
 │   ├── final_logistic_model.joblib
-│   └── model_feature_columns.json
+│   ├── model_feature_columns.json
+│   └── model_metadata.joblib
 ├── main.py
 ├── requirements.txt
 ├── .env.example
 └── .gitignore
+```
 
+## Local Setup
 
-
-Local setup
-
-Use Python 3.12 and a virtual environment.
-
-Plain Text
-
-
+```bash
 py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.venv\Scripts\Activate.ps1
 python -m pip install --no-cache-dir -r requirements.txt
 python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
 
+Interactive docs: `http://127.0.0.1:8000/docs`
 
+`/health` returns:
 
-Open the interactive API documentation at:
+```json
+{ "status": "ok", "service": "VaxiCare ML API", "version": "1.0.0" }
+```
 
-Plain Text
+## Environment Variables
 
-
-http://127.0.0.1:8000/docs
-
-
-
-The health endpoint returns:
-
-JSON
-
-
-{
-  "status": "ok",
-  "service": "VaxiCare ML API",
-  "version": "1.0.0"
-}
-
-
-
-Reminder policy
-
-Child condition
-Risk level
-Fixed reminder schedule
-Server-side ASHA action
-No missed doses
-Normal
-D−1
-Routine monitoring
-1 missed dose
-Low
-D−2, D−1
-Show in ASHA monitoring list
-2 missed doses
-Medium
-D−3, D−2, D−1
-Calling-agent follow-up
-3 or more missed doses
-High
-D−4, D−3, D−2, D−1
-ASHA home visit and calling task
-Due today or overdue
-Any
-Immediate event
-Immediate ASHA urgent follow-up
-
-
-
-
-CORS configuration
-
-Copy .env.example to .env for local development if needed. The ALLOWED_ORIGINS variable accepts a comma-separated list.
-
-Plain Text
-
-
+```
 ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+ENVIRONMENT=development        # set to "production" to enforce strict auth
+STRICT_AUTH=false              # or true to force auth regardless of ENVIRONMENT
+API_KEY=your-key-here
+```
 
+For Render, add the deployed frontend URL to `ALLOWED_ORIGINS`.
 
+## Render Deployment
 
-For Render deployment, add the published frontend URL to ALLOWED_ORIGINS, for example:
+| Setting | Value |
+|---|---|
+| Runtime | Python |
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `uvicorn main:app --host 0.0.0.0 --port $PORT` |
+| Health Check Path | `/health` |
+| Env Vars | `ALLOWED_ORIGINS`, `ENVIRONMENT`, `STRICT_AUTH`, `API_KEY` |
 
-Plain Text
+The `models/` folder must stay in the repo — `main.py` loads both artifacts at startup.
 
+## Prototype Note
 
-ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,https://your-vaxicare-frontend.example
-
-
-
-Render deployment settings
-
-Create a Python Web Service from this repository and use:
-
-Render setting
-Value
-Runtime
-Python
-Build Command
-pip install -r requirements.txt
-Start Command
-uvicorn main:app --host 0.0.0.0 --port $PORT
-Health Check Path
-/health
-Environment Variable
-ALLOWED_ORIGINS with the frontend URL added
-
-
-
-
-The models/ folder must remain in the repository because main.py loads both exported model artifacts at startup.
-
-Important prototype note
-
-This repository is suitable for the VaxiCare prototype. Production rollout should add authenticated access, a database for child and reminder events, secure secrets management, audit logging, verified messaging provider templates, and clinical/public-health review before real-world use.
-
+Production rollout should add a persistent database for child/reminder events, secrets management, audit logging, verified messaging provider integration, and clinical/public-health review before real-world use.
