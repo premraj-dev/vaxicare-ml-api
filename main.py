@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.asha_routes import router as asha_router
+from app.auth import router as auth_router
 from app.auth import verify_api_key
 from app.demo_routes import router as demo_router
 
@@ -73,6 +74,7 @@ app.add_middleware(
 )
 
 # Includes demo and ASHA capacity routes
+app.include_router(auth_router)
 app.include_router(demo_router)
 app.include_router(asha_router)
 

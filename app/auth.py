@@ -1,40 +1,119 @@
-"""VaxiCare authentication & authorization middleware / dependencies."""
-
 import os
-from fastapi import Header, HTTPException, Security, status
-from fastapi.security import APIKeyHeader
+from fastapi import APIRouter, HTTPException, Depends, Security, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field
+from supabase import create_client, Client
 
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
+# Initialize Supabase Client
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-def verify_api_key(
-    x_api_key: str | None = Security(api_key_header),
-) -> str:
-    """Validate incoming API key or JWT token header.
-    
-    Enforces authentication strictly in production mode or when STRICT_AUTH is true.
-    Maintains an intentional sandbox fallback for local dev/demo testing.
-    """
-    configured_key = os.getenv("API_KEY", "vaxicare-secret-key").strip()
-    
-    # If client sends an explicit key, validate it strictly
-    if x_api_key is not None:
-        if x_api_key.strip() in {configured_key, "vaxicare-secret-key", "vaxicare-demo-key"}:
-            return x_api_key.strip()
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or unauthorized API key.",
-        )
-    
-    # Enforce API Key header strictly in production/staging environments
-    env = os.getenv("ENVIRONMENT", os.getenv("ENV", "development")).lower()
-    if env in {"production", "prod", "staging"} or os.getenv("STRICT_AUTH", "").lower() == "true":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing API key. Header X-API-Key is required in production.",
-        )
-    
-    # Return default for local unauthenticated sandbox/demo testing
-    return "demo-unauthenticated"
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    supabase: Client = None
+else:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
+security = HTTPBearer()
+
+class RegisterRequest(BaseModel):
+    full_name: str
+    mobile_number: str = Field(..., pattern=r"^\d{10}$")
+    password: str = "Vaxicare@123"  # Default fallback password for UI simplicity
+    role: str # "Parent" or "ASHA worker"
+
+class LoginRequest(BaseModel):
+    mobile_number: str = Field(..., pattern=r"^\d{10}$")
+    otp: str = Field(..., pattern=r"^\d{6}$")  # Accepts 6-digit OTP from UI
+
+@router.post("/register")
+def register_user(data: RegisterRequest):
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase client not initialized.")
+    
+    normalized_phone = f"+91{data.mobile_number}"
+    internal_email = f"{data.mobile_number}@vaxicare.local"
+
+    try:
+        # Create user in Supabase Auth
+        auth_response = supabase.auth.admin.create_user({
+            "email": internal_email,
+            "password": data.password,
+            "email_confirm": True,
+            "user_metadata": {
+                "full_name": data.full_name,
+                "mobile_number": normalized_phone,
+                "role": data.role
+            }
+        })
+
+        user_id = auth_response.user.id if hasattr(auth_response, 'user') else auth_response.get("user", {}).get("id")
+
+        # Insert record into public.profiles table
+        profile_data = {
+            "id": user_id,
+            "full_name": data.full_name,
+            "mobile_number": normalized_phone,
+            "role": data.role
+        }
+        
+        supabase.table("profiles").insert(profile_data).execute()
+
+        return {
+            "success": True,
+            "message": "User registered successfully!",
+            "user": profile_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/login")
+def login_user(data: LoginRequest):
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase client not initialized.")
+
+    # For demo convenience, accept '123456' as valid OTP
+    if data.otp != "123456":
+        raise HTTPException(status_code=401, detail="Invalid OTP. Use 123456 for demo login.")
+
+    internal_email = f"{data.mobile_number}@vaxicare.local"
+    normalized_phone = f"+91{data.mobile_number}"
+
+    try:
+        # Sign in using the internal email and default demo password
+        auth_response = supabase.auth.sign_in_with_password({
+            "email": internal_email,
+            "password": "Vaxicare@123"
+        })
+
+        if not auth_response.session:
+            raise HTTPException(status_code=401, detail="User not found. Please register first.")
+
+        # Fetch user profile data
+        profile_query = supabase.table("profiles").select("*").eq("mobile_number", normalized_phone).execute()
+        profile = profile_query.data[0] if profile_query.data else {}
+
+        return {
+            "success": True,
+            "message": "Login successful",
+            "access_token": auth_response.session.access_token,
+            "refresh_token": auth_response.session.refresh_token,
+            "user": profile
+        }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
+    """Validates the Supabase bearer token passed from the frontend."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase client not initialized.")
+    
+    token = credentials.credentials
+    try:
+        user_response = supabase.auth.get_user(token)
+        if not user_response or not user_response.user:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials.")
+        return user_response.user
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
