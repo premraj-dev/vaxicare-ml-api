@@ -1,119 +1,117 @@
-import os
-from fastapi import APIRouter, HTTPException, Depends, Security, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import re
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from supabase import create_client, Client
+
+from app.database import get_supabase_auth_client, get_supabase_client
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
-
-# Initialize Supabase Client
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    supabase: Client = None
-else:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
 security = HTTPBearer()
 
-class RegisterRequest(BaseModel):
-    full_name: str
-    mobile_number: str = Field(..., pattern=r"^\d{10}$")
-    password: str = "Vaxicare@123"  # Default fallback password for UI simplicity
-    role: str # "Parent" or "ASHA worker"
 
-class LoginRequest(BaseModel):
-    mobile_number: str = Field(..., pattern=r"^\d{10}$")
-    otp: str = Field(..., pattern=r"^\d{6}$")  # Accepts 6-digit OTP from UI
+class EmailOtpRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
 
-@router.post("/register")
-def register_user(data: RegisterRequest):
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Supabase client not initialized.")
-    
-    normalized_phone = f"+91{data.mobile_number}"
-    internal_email = f"{data.mobile_number}@vaxicare.local"
 
+class LoginRequest(EmailOtpRequest):
+    otp: str = Field(pattern=r"^\d{6}$")
+
+
+def normalize_email_address(email: str) -> str:
+    normalized = email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized):
+        raise HTTPException(status_code=422, detail="Enter a valid email address.")
+    return normalized
+
+
+def _profile_role(role: str | None) -> str:
+    normalized = (role or "").strip().lower()
+    if normalized == "asha worker":
+        return "asha"
+    if normalized not in {"parent", "asha"}:
+        raise HTTPException(status_code=403, detail="Your account has no supported portal role.")
+    return normalized
+
+
+@router.post("/otp/send")
+def send_email_otp(data: EmailOtpRequest) -> dict[str, bool]:
+    email = normalize_email_address(data.email)
     try:
-        # Create user in Supabase Auth
-        auth_response = supabase.auth.admin.create_user({
-            "email": internal_email,
-            "password": data.password,
-            "email_confirm": True,
-            "user_metadata": {
-                "full_name": data.full_name,
-                "mobile_number": normalized_phone,
-                "role": data.role
+        client = get_supabase_auth_client()
+        client.auth.sign_in_with_otp(
+            {
+                "email": email,
+                "options": {"should_create_user": True},
             }
-        })
+        )
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail="Supabase could not send the verification code. Check Auth email configuration.",
+        ) from error
 
-        user_id = auth_response.user.id if hasattr(auth_response, 'user') else auth_response.get("user", {}).get("id")
+    return {"sent": True}
 
-        # Insert record into public.profiles table
-        profile_data = {
-            "id": user_id,
-            "full_name": data.full_name,
-            "mobile_number": normalized_phone,
-            "role": data.role
-        }
-        
-        supabase.table("profiles").insert(profile_data).execute()
-
-        return {
-            "success": True,
-            "message": "User registered successfully!",
-            "user": profile_data
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/login")
-def login_user(data: LoginRequest):
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Supabase client not initialized.")
+def login_user(data: LoginRequest) -> dict[str, Any]:
+    email = normalize_email_address(data.email)
+    try:
+        client = get_supabase_auth_client()
+        auth_response = client.auth.verify_otp(
+            {"email": email, "token": data.otp, "type": "email"}
+        )
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=401, detail="The verification code is invalid or expired.") from error
 
-    # For demo convenience, accept '123456' as valid OTP
-    if data.otp != "123456":
-        raise HTTPException(status_code=401, detail="Invalid OTP. Use 123456 for demo login.")
-
-    internal_email = f"{data.mobile_number}@vaxicare.local"
-    normalized_phone = f"+91{data.mobile_number}"
+    if not auth_response.session or not auth_response.user:
+        raise HTTPException(status_code=401, detail="Supabase did not return a user session.")
 
     try:
-        # Sign in using the internal email and default demo password
-        auth_response = supabase.auth.sign_in_with_password({
-            "email": internal_email,
-            "password": "Vaxicare@123"
-        })
+        profile_response = (
+            get_supabase_client()
+            .table("profiles")
+            .select("id, email, full_name, role")
+            .eq("id", str(auth_response.user.id))
+            .limit(1)
+            .execute()
+        )
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="Unable to load your account profile.") from error
 
-        if not auth_response.session:
-            raise HTTPException(status_code=401, detail="User not found. Please register first.")
+    if not profile_response.data:
+        raise HTTPException(
+            status_code=403,
+            detail="Your account profile is missing. Ask an administrator to complete account setup.",
+        )
 
-        # Fetch user profile data
-        profile_query = supabase.table("profiles").select("*").eq("mobile_number", normalized_phone).execute()
-        profile = profile_query.data[0] if profile_query.data else {}
+    profile = profile_response.data[0]
+    profile["role"] = _profile_role(profile.get("role"))
+    return {
+        "success": True,
+        "access_token": auth_response.session.access_token,
+        "refresh_token": auth_response.session.refresh_token,
+        "user_profile": profile,
+    }
 
-        return {
-            "success": True,
-            "message": "Login successful",
-            "access_token": auth_response.session.access_token,
-            "refresh_token": auth_response.session.refresh_token,
-            "user": profile
-        }
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
 
-def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
-    """Validates the Supabase bearer token passed from the frontend."""
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Supabase client not initialized.")
-    
-    token = credentials.credentials
+def verify_api_key(
+    credentials: HTTPAuthorizationCredentials = Security(security),
+) -> Any:
+    """Validate a Supabase user JWT; the service-role key never leaves this API."""
     try:
-        user_response = supabase.auth.get_user(token)
-        if not user_response or not user_response.user:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials.")
-        return user_response.user
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
+        user_response = get_supabase_client().auth.get_user(credentials.credentials)
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials.") from error
+
+    if not user_response or not user_response.user:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials.")
+    return user_response.user

@@ -5,4 +5,5 @@ joblib==1.4.2
 pandas==2.2.2
 numpy==1.26.4
 python-dotenv==1.0.1
+resend>=2.0,<3.0
 supabase==2.31.0

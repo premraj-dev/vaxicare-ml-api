@@ -6,19 +6,21 @@ from typing import Literal
 
 import joblib
 import pandas as pd
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.asha_routes import router as asha_router
 from app.auth import router as auth_router
-from app.auth import verify_api_key
-from app.demo_routes import router as demo_router
+from app.dashboard import router as dashboard_router
+from app.email import router as email_router
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 
 # VaxiCare ML API: model-driven risk ranking with server-enforced reminder policy.
 # The Supabase service-role key is read only by app.database on the backend.
-BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "models" / "final_logistic_model.joblib"
 FEATURE_COLUMNS_PATH = BASE_DIR / "models" / "model_feature_columns.json"
 
@@ -70,13 +72,12 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-# Includes demo and ASHA capacity routes
 app.include_router(auth_router)
-app.include_router(demo_router)
-app.include_router(asha_router)
+app.include_router(dashboard_router)
+app.include_router(email_router)
 
 
 
@@ -272,6 +273,7 @@ def health_check() -> dict:
         "supabase_configured": bool(
             os.getenv("SUPABASE_URL", "").strip()
             and os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+            and os.getenv("SUPABASE_ANON_KEY", "").strip()
         ),
     }
 
@@ -396,4 +398,3 @@ def create_reminder_plan(request: ReminderPlanRequest) -> dict:
         "asha_action": asha_action,
         "reminders": reminders,
     }
-
