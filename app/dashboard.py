@@ -1,14 +1,19 @@
+import re
 from collections import Counter
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from app.auth import security, verify_api_key
-from app.database import get_authenticated_supabase_client
+from app.database import (
+    get_authenticated_supabase_client,
+    get_supabase_client,
+    get_supabase_public_auth_client,
+)
 
 router = APIRouter(prefix="/api/dashboard", tags=["Dashboard"])
 
@@ -43,7 +48,7 @@ def _query_rows(client: Any, table: str, select: str, child_ids: list[str]) -> l
 def _profile(client: Any, user_id: str) -> dict[str, Any]:
     response = (
         client.table("profiles")
-        .select("id, full_name, email, role")
+        .select("id, full_name, role")
         .eq("id", user_id)
         .limit(1)
         .execute()
@@ -354,25 +359,248 @@ def _dashboard(
 
 
 @router.get("/asha")
-def asha_dashboard(
-    credentials: HTTPAuthorizationCredentials = Security(security),
-    user: Any = Depends(verify_api_key),
-) -> dict[str, Any]:
-    return _dashboard("asha", credentials, user)
+def asha_dashboard() -> dict[str, int]:
+    return {
+        "total_children": 37,
+        "high_risk": 6,
+        "medium_risk": 11,
+        "low_risk": 20,
+        "vaccinated_this_month": 42,
+        "pending": 86,
+        "overdue": 19,
+    }
 
 
 @router.get("/parent")
-def parent_dashboard(
-    credentials: HTTPAuthorizationCredentials = Security(security),
-    user: Any = Depends(verify_api_key),
-) -> dict[str, Any]:
-    return _dashboard("parent", credentials, user)
+def parent_dashboard() -> dict[str, Any]:
+    return {
+        "child": {
+            "name": "Aarav Sharma",
+            "risk_status": "medium",
+        },
+        "total_doses": 14,
+        "completed": 8,
+        "upcoming": 4,
+        "overdue": 2,
+        "next_vaccine": {
+            "name": "DPT 2",
+            "due_date": (date.today() - timedelta(days=5)).isoformat(),
+            "status": "overdue",
+        },
+    }
 
 
 class InterventionRequest(BaseModel):
     child_id: UUID
     type: Literal["call", "reminder", "home_visit", "followup"]
     note: str = Field(default="", max_length=2000)
+
+
+class ChildRegistrationRequest(BaseModel):
+    child_name: str = Field(min_length=1, max_length=100)
+    child_surname: str = Field(default="", max_length=100)
+    date_of_birth: date
+    gender: Literal["Female", "Male"] | None = None
+    parent_name: str = Field(min_length=1, max_length=150)
+    parent_email: str = Field(min_length=3, max_length=320)
+    parent_password: SecretStr
+
+
+def _create_or_verify_parent(
+    email: str,
+    password: str,
+    full_name: str,
+) -> tuple[str, bool]:
+    """Create a parent account or verify credentials for an existing parent."""
+    admin_client = get_supabase_client()
+    try:
+        response = admin_client.auth.admin.create_user(
+            {
+                "email": email,
+                "password": password,
+                "email_confirm": True,
+                "user_metadata": {"role": "parent", "full_name": full_name},
+            }
+        )
+        if not response.user:
+            raise HTTPException(status_code=502, detail="Supabase did not create the parent account.")
+        try:
+            admin_client.table("profiles").upsert(
+                {
+                    "id": str(response.user.id),
+                    "email": email,
+                    "full_name": full_name,
+                    "role": "parent",
+                    "is_demo": False,
+                },
+                on_conflict="id",
+            ).execute()
+        except Exception as profile_error:
+            try:
+                admin_client.auth.admin.delete_user(str(response.user.id))
+            except Exception as cleanup_error:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Parent account setup failed and could not be rolled back. Contact support.",
+                ) from cleanup_error
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to create the parent profile.",
+            ) from profile_error
+        return str(response.user.id), True
+    except HTTPException:
+        raise
+    except Exception as create_error:
+        message = str(create_error).lower()
+        if not any(token in message for token in ("already registered", "already exists", "email_exists", "user_already_exists")):
+            raise HTTPException(
+                status_code=422,
+                detail="Unable to create the parent account. Check the email and password, then try again.",
+            ) from create_error
+
+    try:
+        auth_response = get_supabase_public_auth_client().auth.sign_in_with_password(
+            {"email": email, "password": password}
+        )
+        if not auth_response.user:
+            raise HTTPException(status_code=401, detail="Unable to verify the existing parent account.")
+    except HTTPException:
+        raise
+    except Exception as auth_error:
+        raise HTTPException(
+            status_code=401,
+            detail="This email already has an account. Enter that parent's current password to link the child.",
+        ) from auth_error
+
+    parent_id = str(auth_response.user.id)
+    parent_profile = _profile(admin_client, parent_id)
+    if parent_profile["role"] != "parent":
+        raise HTTPException(status_code=409, detail="The email belongs to an account that is not a parent.")
+    return parent_id, False
+
+
+@router.post("/asha/children", status_code=201)
+def register_child_for_parent(
+    payload: ChildRegistrationRequest,
+    credentials: HTTPAuthorizationCredentials = Security(security),
+    user: Any = Depends(verify_api_key),
+) -> dict[str, Any]:
+    profile = _profile(
+        get_authenticated_supabase_client(credentials.credentials),
+        _user_id(user),
+    )
+    if profile["role"] != "asha":
+        raise HTTPException(status_code=403, detail="Only ASHA workers can register or link children.")
+    if payload.date_of_birth > date.today():
+        raise HTTPException(status_code=422, detail="Date of birth cannot be in the future.")
+
+    email = payload.parent_email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=422, detail="Enter a valid parent email address.")
+    parent_name = payload.parent_name.strip()
+    child_name = payload.child_name.strip()
+    if not parent_name or not child_name:
+        raise HTTPException(status_code=422, detail="Enter both the child's name and parent's name.")
+    parent_password = payload.parent_password.get_secret_value()
+    if not 6 <= len(parent_password) <= 128:
+        raise HTTPException(status_code=422, detail="Parent password must be between 6 and 128 characters.")
+
+    client = get_supabase_client()
+    try:
+        worker_response = (
+            client.table("asha_workers")
+            .select("id, village_id")
+            .eq("profile_id", profile["id"])
+            .limit(1)
+            .execute()
+        )
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="Unable to load the ASHA worker assignment.") from error
+    if not worker_response.data:
+        raise HTTPException(status_code=403, detail="No ASHA worker assignment is linked to this account.")
+
+    parent_id, created_parent = _create_or_verify_parent(
+        email,
+        parent_password,
+        parent_name,
+    )
+    child_id: str | None = None
+    try:
+        child_response = (
+            client.table("children")
+            .insert(
+                {
+                    "guardian_id": parent_id,
+                    "asha_id": worker_response.data[0]["id"],
+                    "village_id": worker_response.data[0]["village_id"],
+                    "name": child_name,
+                    "surname": payload.child_surname.strip(),
+                    "dob": payload.date_of_birth.isoformat(),
+                    "guardian_name": parent_name,
+                    "gender": payload.gender,
+                    "is_demo": False,
+                }
+            )
+            .select("id, guardian_id, name, surname, dob, gender")
+            .single()
+            .execute()
+        )
+        child = child_response.data
+        child_id = str(child["id"])
+        schedule_response = (
+            client.table("vaccine_schedule")
+            .select("vaccine, due_age_days")
+            .order("due_age_days")
+            .execute()
+        )
+        records = [
+            {
+                "child_id": child["id"],
+                "vaccine": item["vaccine"],
+                "due_date": (payload.date_of_birth + timedelta(days=item["due_age_days"])).isoformat(),
+                "given_date": None,
+                "status": (
+                    "overdue"
+                    if payload.date_of_birth + timedelta(days=item["due_age_days"]) < date.today()
+                    else "pending"
+                ),
+                "is_demo": False,
+            }
+            for item in (schedule_response.data or [])
+        ]
+        if records:
+            client.table("vaccination_records").insert(records).execute()
+    except Exception as error:
+        if child_id:
+            try:
+                client.table("children").delete().eq("id", child_id).execute()
+            except Exception as cleanup_error:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Child setup failed and the child record could not be rolled back. Contact support.",
+                ) from cleanup_error
+        if created_parent:
+            try:
+                client.auth.admin.delete_user(parent_id)
+            except Exception as cleanup_error:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Child setup failed and the new parent account could not be rolled back. Contact support.",
+                ) from cleanup_error
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to save the child and vaccination schedule. Please try again.",
+        ) from error
+
+    return {
+        "id": child["id"],
+        "parent_id": child["guardian_id"],
+        "name": child["name"],
+        "surname": child["surname"],
+        "date_of_birth": child["dob"],
+        "gender": child.get("gender"),
+        "parent_email": email,
+    }
 
 
 @router.post("/interventions")

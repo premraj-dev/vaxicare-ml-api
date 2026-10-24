@@ -32,8 +32,11 @@ Logistic Regression is deployed as the production model.
 | `/api/send-email` | POST | Supabase bearer token | Sends a registration-success email to the authenticated user's own email address |
 | `/api/dashboard/asha` | GET | Supabase bearer token | Returns assigned children, live counts, predictions, records, and interventions |
 | `/api/dashboard/parent` | GET | Supabase bearer token | Returns only the authenticated parent's children and related records |
+| `/api/dashboard/asha/children` | POST | Supabase bearer token | Creates or verifies a parent account, links a child to the authenticated ASHA worker, and initializes scheduled vaccine records |
 | `/api/dashboard/interventions` | POST | Supabase bearer token | Records an ASHA action for an assigned child |
 | `/api/dashboard/interventions/{id}/resolve` | PATCH | Supabase bearer token | Resolves an assigned intervention |
+
+The ASHA child-registration request accepts `child_name`, optional `child_surname`, `date_of_birth` (`YYYY-MM-DD`), optional `gender` (`Female` or `Male`), `parent_name`, `parent_email`, and `parent_password`. New parent accounts are created server-side with confirmed email and a `parent` profile. If the email already exists, the supplied password is verified and the existing account must have the `parent` role before a child can be linked. The child is assigned to the ASHA worker's area and initialized from `vaccine_schedule`; the password is never stored with child records or returned.
 | `/api/v1/predict` | POST | None | Returns dropout probability, risk level, priority score, action, and risk reasons |
 | `/api/v1/reminder-plan` | POST | None | Generates the existing missed-dose/risk-based reminder schedule |
 
